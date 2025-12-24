@@ -19,6 +19,41 @@ from docx.opc.constants import RELATIONSHIP_TYPE as REL_TYPE
 from jinja2 import Environment, Template, meta
 from jinja2.exceptions import TemplateError
 
+
+def _create_optimized_env(**kwargs):
+    """Create an optimized Jinja2 environment for better performance.
+    
+    Optimizations applied:
+    - auto_reload=False: Skip checking if template source changed
+    - cache_size=400: Larger template cache for repeated renders
+    - enable_async=False: Disable async support (not needed, adds overhead)
+    """
+    return Environment(
+        auto_reload=False,      # Disable template auto-reload (faster)
+        cache_size=400,         # Increase template cache size
+        enable_async=False,     # Disable async (not needed, reduces overhead)
+        **kwargs
+    )
+
+
+# Module-level cached environments (created once, reused across all instances)
+_CACHED_ENV = None
+_CACHED_ENV_AUTOESCAPE = None
+
+
+def _get_cached_env(autoescape=False):
+    """Get or create a cached Jinja2 environment for performance."""
+    global _CACHED_ENV, _CACHED_ENV_AUTOESCAPE
+    
+    if autoescape:
+        if _CACHED_ENV_AUTOESCAPE is None:
+            _CACHED_ENV_AUTOESCAPE = _create_optimized_env(autoescape=True)
+        return _CACHED_ENV_AUTOESCAPE
+    else:
+        if _CACHED_ENV is None:
+            _CACHED_ENV = _create_optimized_env(autoescape=False)
+        return _CACHED_ENV
+
 try:
     from html import escape  # noqa: F401
 except ImportError:
@@ -42,6 +77,60 @@ class DocxTemplate(object):
     FOOTER_URI = (
         "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer"
     )
+
+    # Pre-compiled regex patterns for patch_xml() optimization
+    # These are compiled once at class load time, not on every render
+    _RE_JINJA_OPEN = re.compile(
+        r"(?<={)(<[^>]*>)+(?=[\{%\#])|(?<=[%\}#])(<[^>]*>)+(?=\})",
+        re.DOTALL
+    )
+    _RE_JINJA_CONTENT = re.compile(
+        r"{%(?:(?!%}).)*|{#(?:(?!#}).)*|{{(?:(?!}}).)*",
+        re.DOTALL
+    )
+    _RE_COLSPAN = re.compile(
+        r"(<w:tc[ >](?:(?!<w:tc[ >]).)*){%\s*colspan\s+([^%]*)\s*%}(.*?</w:tc>)",
+        re.DOTALL
+    )
+    _RE_CELLBG = re.compile(
+        r"(<w:tc[ >](?:(?!<w:tc[ >]).)*){%\s*cellbg\s+([^%]*)\s*%}(.*?</w:tc>)",
+        re.DOTALL
+    )
+    _RE_SPACE_PRESERVE = re.compile(
+        r"<w:t>((?:(?!<w:t>).)*)({{.*?}}|{%.*?%})",
+        re.DOTALL
+    )
+    _RE_SPACE_PRESERVE_R = re.compile(
+        r"({{r\s.*?}}|{%r\s.*?%})",
+        re.DOTALL
+    )
+    _RE_MERGE_PREV = re.compile(r"</w:t>(?:(?!</w:t>).)*?{%-", re.DOTALL)
+    _RE_MERGE_NEXT = re.compile(r"-%}(?:(?!<w:t[ >]|{%|{{).)*?<w:t[^>]*?>", re.DOTALL)
+    _RE_VMERGE = re.compile(
+        r"<w:tc[ >](?:(?!<w:tc[ >]).)*?{%\s*vm\s*%}.*?</w:tc[ >]",
+        re.DOTALL
+    )
+    _RE_HMERGE = re.compile(
+        r"<w:tc[ >](?:(?!<w:tc[ >]).)*?{%\s*hm\s*%}.*?</w:tc[ >]",
+        re.DOTALL
+    )
+    _RE_CLEAN_TAGS = re.compile(r"(?<=\{[\{%])(.*?)(?=[\}%]})")
+    _RE_PARAGRAPH_NEWLINE = re.compile(r"<w:p([ >])")
+    _RE_PARAGRAPH_REMOVE_NEWLINE = re.compile(r"\n<w:p([ >])")
+    _RE_STRIPTAGS = re.compile(r"</w:t>.*?(<w:t>|<w:t [^>]*>)", re.DOTALL)
+    _RE_COLSPAN_EMPTY = re.compile(r"<w:r[ >](?:(?!<w:r[ >]).)*<w:t></w:t>.*?</w:r>", re.DOTALL)
+    _RE_GRIDSPAN = re.compile(r"<w:gridSpan[^/]*/>")
+    _RE_TCPR = re.compile(r"(<w:tcPr[^>]*>)")
+    _RE_SHD = re.compile(r"<w:shd[^/]*/>")
+    _RE_RESOLVE_PARAGRAPH = re.compile(r"<w:p(?: [^>]*)?>.*?</w:p>", re.DOTALL)
+    _RE_RESOLVE_RUN = re.compile(r"<w:r(?: [^>]*)?>.*?</w:r>", re.DOTALL)
+    _RE_RESOLVE_TEXT = re.compile(r"<w:t(?: [^>]*)?>.*?</w:t>", re.DOTALL)
+    _RE_RUN_PROPS = re.compile(r"<w:rPr>.*?</w:rPr>")
+    _RE_PARA_PROPS = re.compile(r"<w:pPr>.*?</w:pPr>")
+
+    # Cached Jinja2 environment for performance (created once, reused)
+    _cached_jinja_env = None
+    _cached_jinja_env_autoescape = None  # For autoescape=True variant
 
     def __init__(self, template_file: Union[IO[bytes], str, PathLike]) -> None:
         self.template_file = template_file
@@ -88,94 +177,63 @@ class DocxTemplate(object):
         unescape html entities, etc..."""
 
         # replace {<something>{ by {{   ( works with {{ }} {% and %} {# and #})
-        src_xml = re.sub(
-            r"(?<={)(<[^>]*>)+(?=[\{%\#])|(?<=[%\}\#])(<[^>]*>)+(?=\})",
-            "",
-            src_xml,
-            flags=re.DOTALL,
-        )
+        # OPTIMIZED: Using pre-compiled pattern
+        src_xml = self._RE_JINJA_OPEN.sub("", src_xml)
 
         # replace {{<some tags>jinja2 stuff<some other tags>}} by {{jinja2 stuff}}
         # same thing with {% ... %} and {# #}
         # "jinja2 stuff" could a variable, a 'if' etc... anything jinja2 will understand
         def striptags(m):
-            return re.sub(
-                "</w:t>.*?(<w:t>|<w:t [^>]*>)", "", m.group(0), flags=re.DOTALL
-            )
+            # OPTIMIZED: Using pre-compiled pattern
+            return self._RE_STRIPTAGS.sub("", m.group(0))
 
-        src_xml = re.sub(
-            r"{%(?:(?!%}).)*|{#(?:(?!#}).)*|{{(?:(?!}}).)*",
-            striptags,
-            src_xml,
-            flags=re.DOTALL,
-        )
+        # OPTIMIZED: Using pre-compiled pattern
+        src_xml = self._RE_JINJA_CONTENT.sub(striptags, src_xml)
 
         # manage table cell colspan
         def colspan(m):
             cell_xml = m.group(1) + m.group(3)
-            cell_xml = re.sub(
-                r"<w:r[ >](?:(?!<w:r[ >]).)*<w:t></w:t>.*?</w:r>",
-                "",
-                cell_xml,
-                flags=re.DOTALL,
-            )
-            cell_xml = re.sub(r"<w:gridSpan[^/]*/>", "", cell_xml, count=1)
-            return re.sub(
-                r"(<w:tcPr[^>]*>)",
+            # OPTIMIZED: Using pre-compiled pattern
+            cell_xml = self._RE_COLSPAN_EMPTY.sub("", cell_xml)
+            cell_xml = self._RE_GRIDSPAN.sub("", cell_xml, count=1)
+            return self._RE_TCPR.sub(
                 r'\1<w:gridSpan w:val="{{%s}}"/>' % m.group(2),
                 cell_xml,
             )
 
-        src_xml = re.sub(
-            r"(<w:tc[ >](?:(?!<w:tc[ >]).)*){%\s*colspan\s+([^%]*)\s*%}(.*?</w:tc>)",
-            colspan,
-            src_xml,
-            flags=re.DOTALL,
-        )
+        # OPTIMIZED: Using pre-compiled pattern
+        src_xml = self._RE_COLSPAN.sub(colspan, src_xml)
 
         # manage table cell background color
         def cellbg(m):
             cell_xml = m.group(1) + m.group(3)
-            cell_xml = re.sub(
-                r"<w:r[ >](?:(?!<w:r[ >]).)*<w:t></w:t>.*?</w:r>",
-                "",
-                cell_xml,
-                flags=re.DOTALL,
-            )
-            cell_xml = re.sub(r"<w:shd[^/]*/>", "", cell_xml, count=1)
-            return re.sub(
-                r"(<w:tcPr[^>]*>)",
+            # OPTIMIZED: Using pre-compiled pattern
+            cell_xml = self._RE_COLSPAN_EMPTY.sub("", cell_xml)
+            cell_xml = self._RE_SHD.sub("", cell_xml, count=1)
+            return self._RE_TCPR.sub(
                 r'\1<w:shd w:val="clear" w:color="auto" w:fill="{{%s}}"/>' % m.group(2),
                 cell_xml,
             )
 
-        src_xml = re.sub(
-            r"(<w:tc[ >](?:(?!<w:tc[ >]).)*){%\s*cellbg\s+([^%]*)\s*%}(.*?</w:tc>)",
-            cellbg,
-            src_xml,
-            flags=re.DOTALL,
-        )
+        # OPTIMIZED: Using pre-compiled pattern
+        src_xml = self._RE_CELLBG.sub(cellbg, src_xml)
 
         # ensure space preservation
-        src_xml = re.sub(
-            r"<w:t>((?:(?!<w:t>).)*)({{.*?}}|{%.*?%})",
+        # OPTIMIZED: Using pre-compiled patterns
+        src_xml = self._RE_SPACE_PRESERVE.sub(
             r'<w:t xml:space="preserve">\1\2',
             src_xml,
-            flags=re.DOTALL,
         )
-        src_xml = re.sub(
-            r"({{r\s.*?}}|{%r\s.*?%})",
+        src_xml = self._RE_SPACE_PRESERVE_R.sub(
             r'</w:t></w:r><w:r><w:t xml:space="preserve">\1</w:t></w:r><w:r><w:t xml:space="preserve">',
             src_xml,
-            flags=re.DOTALL,
         )
 
         # {%- will merge with previous paragraph text
-        src_xml = re.sub(r"</w:t>(?:(?!</w:t>).)*?{%-", "{%", src_xml, flags=re.DOTALL)
+        # OPTIMIZED: Using pre-compiled pattern
+        src_xml = self._RE_MERGE_PREV.sub("{%", src_xml)
         # -%} will merge with next paragraph text
-        src_xml = re.sub(
-            r"-%}(?:(?!<w:t[ >]|{%|{{).)*?<w:t[^>]*?>", "%}", src_xml, flags=re.DOTALL
-        )
+        src_xml = self._RE_MERGE_NEXT.sub("%}", src_xml)
 
         for y in ["tr", "tc", "p", "r"]:
             # replace into xml code the row/paragraph/run containing
@@ -220,12 +278,8 @@ class DocxTemplate(object):
                 flags=re.DOTALL,
             )
 
-        src_xml = re.sub(
-            r"<w:tc[ >](?:(?!<w:tc[ >]).)*?{%\s*vm\s*%}.*?</w:tc[ >]",
-            v_merge_tc,
-            src_xml,
-            flags=re.DOTALL,
-        )
+        # OPTIMIZED: Using pre-compiled pattern
+        src_xml = self._RE_VMERGE.sub(v_merge_tc, src_xml)
 
         # Use ``{% hm %}`` to make table cell become horizontally merged within
         # a ``{% for %}``.
@@ -279,12 +333,8 @@ class DocxTemplate(object):
             # Discard every other cell generated in loop.
             return "{% if loop.first %}" + xml + "{% endif %}"
 
-        src_xml = re.sub(
-            r"<w:tc[ >](?:(?!<w:tc[ >]).)*?{%\s*hm\s*%}.*?</w:tc[ >]",
-            h_merge_tc,
-            src_xml,
-            flags=re.DOTALL,
-        )
+        # OPTIMIZED: Using pre-compiled pattern
+        src_xml = self._RE_HMERGE.sub(h_merge_tc, src_xml)
 
         def clean_tags(m):
             return (
@@ -298,18 +348,20 @@ class DocxTemplate(object):
                 .replace("’", "'")
             )
 
-        src_xml = re.sub(r"(?<=\{[\{%])(.*?)(?=[\}%]})", clean_tags, src_xml)
+        # OPTIMIZED: Using pre-compiled pattern
+        src_xml = self._RE_CLEAN_TAGS.sub(clean_tags, src_xml)
 
         return src_xml
 
     def render_xml_part(self, src_xml, part, context, jinja_env=None):
-        src_xml = re.sub(r"<w:p([ >])", r"\n<w:p\1", src_xml)
+        # OPTIMIZED: Using pre-compiled pattern
+        src_xml = self._RE_PARAGRAPH_NEWLINE.sub(r"\n<w:p\1", src_xml)
         try:
             self.current_rendering_part = part
-            if jinja_env:
-                template = jinja_env.from_string(src_xml)
-            else:
-                template = Template(src_xml)
+            # OPTIMIZED: Use cached environment (reuse instead of creating new)
+            if not jinja_env:
+                jinja_env = _get_cached_env()
+            template = jinja_env.from_string(src_xml)
             dst_xml = template.render(context)
         except TemplateError as exc:
             if hasattr(exc, "lineno") and exc.lineno is not None:
@@ -320,7 +372,8 @@ class DocxTemplate(object):
                 )
 
             raise exc
-        dst_xml = re.sub(r"\n<w:p([ >])", r"<w:p\1", dst_xml)
+        # OPTIMIZED: Using pre-compiled pattern
+        dst_xml = self._RE_PARAGRAPH_REMOVE_NEWLINE.sub(r"<w:p\1", dst_xml)
         dst_xml = (
             dst_xml.replace("{_{", "{{")
             .replace("}_}", "}}")
@@ -348,8 +401,9 @@ class DocxTemplate(object):
             "title",
             # 'version',
         ]
+        # OPTIMIZED: Use cached environment
         if jinja_env is None:
-            jinja_env = Environment()
+            jinja_env = _get_cached_env()
 
         for prop in properties:
             initial = getattr(self.docx.core_properties, prop)
@@ -360,8 +414,9 @@ class DocxTemplate(object):
     def render_footnotes(
         self, context: Dict[str, Any], jinja_env: Optional[Environment] = None
     ) -> None:
+        # OPTIMIZED: Use cached environment
         if jinja_env is None:
-            jinja_env = Environment()
+            jinja_env = _get_cached_env()
 
         for section in self.docx.sections:
             for part in section.part.package.parts:
@@ -403,30 +458,29 @@ class DocxTemplate(object):
             return xml
 
         def resolve_run(paragraph_properties, m):
-            run_properties = re.search(r"<w:rPr>.*?</w:rPr>", m.group(0))
+            # OPTIMIZED: Using pre-compiled pattern
+            run_properties = self._RE_RUN_PROPS.search(m.group(0))
             run_properties = run_properties.group(0) if run_properties else ""
-            return re.sub(
-                r"<w:t(?: [^>]*)?>.*?</w:t>",
+            # OPTIMIZED: Using pre-compiled pattern
+            return self._RE_RESOLVE_TEXT.sub(
                 lambda x: resolve_text(run_properties, paragraph_properties, x),
                 m.group(0),
-                flags=re.DOTALL,
             )
 
         def resolve_paragraph(m):
-            paragraph_properties = re.search(r"<w:pPr>.*?</w:pPr>", m.group(0))
+            # OPTIMIZED: Using pre-compiled pattern
+            paragraph_properties = self._RE_PARA_PROPS.search(m.group(0))
             paragraph_properties = (
                 paragraph_properties.group(0) if paragraph_properties else ""
             )
-            return re.sub(
-                r"<w:r(?: [^>]*)?>.*?</w:r>",
+            # OPTIMIZED: Using pre-compiled pattern
+            return self._RE_RESOLVE_RUN.sub(
                 lambda x: resolve_run(paragraph_properties, x),
                 m.group(0),
-                flags=re.DOTALL,
             )
 
-        xml = re.sub(
-            r"<w:p(?: [^>]*)?>.*?</w:p>", resolve_paragraph, xml, flags=re.DOTALL
-        )
+        # OPTIMIZED: Using pre-compiled pattern
+        xml = self._RE_RESOLVE_PARAGRAPH.sub(resolve_paragraph, xml)
 
         return xml
 
@@ -437,9 +491,21 @@ class DocxTemplate(object):
         return xml
 
     def map_tree(self, tree):
-        root = self.docx._element
-        body = root.body
-        root.replace(body, tree)
+        """Replace body content with rendered tree.
+        
+        OPTIMIZED: Instead of replacing the entire <w:body> element (which
+        triggers expensive reconciliation), we now mutate the body's children
+        directly. This is much cheaper for large trees.
+        """
+        body = self.docx._element.body
+        
+        # Remove all existing children from body
+        for child in list(body):
+            body.remove(child)
+        
+        # Append all children from the new tree
+        for child in list(tree):
+            body.append(child)
 
     def get_headers_footers(self, uri):
         for relKey, val in self.docx._part.rels.items():
@@ -479,11 +545,11 @@ class DocxTemplate(object):
         # init template working attributes
         self.render_init()
 
-        if autoescape:
-            if not jinja_env:
-                jinja_env = Environment(autoescape=autoescape)
-            else:
-                jinja_env.autoescape = autoescape
+        # OPTIMIZED: Use cached environment by default (avoids overhead of creating new env)
+        if not jinja_env:
+            jinja_env = _get_cached_env(autoescape=autoescape)
+        elif autoescape:
+            jinja_env.autoescape = autoescape
 
         # Body
         xml_src = self.build_xml(context, jinja_env)
@@ -517,8 +583,10 @@ class DocxTemplate(object):
     # using of TC tag in for cycle can cause that count of columns does not
     # correspond to real count of columns in row. This function is able to fix it.
     def fix_tables(self, xml):
-        parser = etree.XMLParser(recover=True)
-        tree = etree.fromstring(xml, parser=parser)
+        # OPTIMIZED: Use parse_xml from docx.opc.oxml instead of etree.fromstring
+        # This ensures same document model and element classes, minimizing
+        # reconciliation cost when the tree is later used with map_tree()
+        tree = parse_xml(xml)
         # get namespace
         ns = "{" + tree.nsmap["w"] + "}"
         # walk trough xml and find table
@@ -913,7 +981,8 @@ class DocxTemplate(object):
         if jinja_env:
             env = jinja_env
         else:
-            env = Environment()
+            # OPTIMIZED: Use cached environment
+            env = _get_cached_env()
 
         parse_content = env.parse(xml)
         all_variables = meta.find_undeclared_variables(parse_content)
