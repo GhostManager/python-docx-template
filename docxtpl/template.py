@@ -15,6 +15,8 @@ from docx import Document
 from docx.opc.oxml import parse_xml
 from docx.opc.part import XmlPart
 import docx.oxml.ns
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE as REL_TYPE
 from jinja2 import Environment, Template, meta
 from jinja2.exceptions import TemplateError
@@ -128,10 +130,6 @@ class DocxTemplate(object):
     _RE_RUN_PROPS = re.compile(r"<w:rPr>.*?</w:rPr>")
     _RE_PARA_PROPS = re.compile(r"<w:pPr>.*?</w:pPr>")
 
-    # Cached Jinja2 environment for performance (created once, reused)
-    _cached_jinja_env = None
-    _cached_jinja_env_autoescape = None  # For autoescape=True variant
-
     def __init__(self, template_file: Union[IO[bytes], str, PathLike]) -> None:
         self.template_file = template_file
         self.reset_replacements()
@@ -177,23 +175,19 @@ class DocxTemplate(object):
         unescape html entities, etc..."""
 
         # replace {<something>{ by {{   ( works with {{ }} {% and %} {# and #})
-        # OPTIMIZED: Using pre-compiled pattern
         src_xml = self._RE_JINJA_OPEN.sub("", src_xml)
 
         # replace {{<some tags>jinja2 stuff<some other tags>}} by {{jinja2 stuff}}
         # same thing with {% ... %} and {# #}
         # "jinja2 stuff" could a variable, a 'if' etc... anything jinja2 will understand
         def striptags(m):
-            # OPTIMIZED: Using pre-compiled pattern
             return self._RE_STRIPTAGS.sub("", m.group(0))
 
-        # OPTIMIZED: Using pre-compiled pattern
         src_xml = self._RE_JINJA_CONTENT.sub(striptags, src_xml)
 
         # manage table cell colspan
         def colspan(m):
             cell_xml = m.group(1) + m.group(3)
-            # OPTIMIZED: Using pre-compiled pattern
             cell_xml = self._RE_COLSPAN_EMPTY.sub("", cell_xml)
             cell_xml = self._RE_GRIDSPAN.sub("", cell_xml, count=1)
             return self._RE_TCPR.sub(
@@ -201,13 +195,11 @@ class DocxTemplate(object):
                 cell_xml,
             )
 
-        # OPTIMIZED: Using pre-compiled pattern
         src_xml = self._RE_COLSPAN.sub(colspan, src_xml)
 
         # manage table cell background color
         def cellbg(m):
             cell_xml = m.group(1) + m.group(3)
-            # OPTIMIZED: Using pre-compiled pattern
             cell_xml = self._RE_COLSPAN_EMPTY.sub("", cell_xml)
             cell_xml = self._RE_SHD.sub("", cell_xml, count=1)
             return self._RE_TCPR.sub(
@@ -215,11 +207,9 @@ class DocxTemplate(object):
                 cell_xml,
             )
 
-        # OPTIMIZED: Using pre-compiled pattern
         src_xml = self._RE_CELLBG.sub(cellbg, src_xml)
 
         # ensure space preservation
-        # OPTIMIZED: Using pre-compiled patterns
         src_xml = self._RE_SPACE_PRESERVE.sub(
             r'<w:t xml:space="preserve">\1\2',
             src_xml,
@@ -230,7 +220,6 @@ class DocxTemplate(object):
         )
 
         # {%- will merge with previous paragraph text
-        # OPTIMIZED: Using pre-compiled pattern
         src_xml = self._RE_MERGE_PREV.sub("{%", src_xml)
         # -%} will merge with next paragraph text
         src_xml = self._RE_MERGE_NEXT.sub("%}", src_xml)
@@ -278,7 +267,6 @@ class DocxTemplate(object):
                 flags=re.DOTALL,
             )
 
-        # OPTIMIZED: Using pre-compiled pattern
         src_xml = self._RE_VMERGE.sub(v_merge_tc, src_xml)
 
         # Use ``{% hm %}`` to make table cell become horizontally merged within
@@ -333,7 +321,6 @@ class DocxTemplate(object):
             # Discard every other cell generated in loop.
             return "{% if loop.first %}" + xml + "{% endif %}"
 
-        # OPTIMIZED: Using pre-compiled pattern
         src_xml = self._RE_HMERGE.sub(h_merge_tc, src_xml)
 
         def clean_tags(m):
@@ -348,17 +335,14 @@ class DocxTemplate(object):
                 .replace("’", "'")
             )
 
-        # OPTIMIZED: Using pre-compiled pattern
         src_xml = self._RE_CLEAN_TAGS.sub(clean_tags, src_xml)
 
         return src_xml
 
     def render_xml_part(self, src_xml, part, context, jinja_env=None):
-        # OPTIMIZED: Using pre-compiled pattern
         src_xml = self._RE_PARAGRAPH_NEWLINE.sub(r"\n<w:p\1", src_xml)
         try:
             self.current_rendering_part = part
-            # OPTIMIZED: Use cached environment (reuse instead of creating new)
             if not jinja_env:
                 jinja_env = _get_cached_env()
             template = jinja_env.from_string(src_xml)
@@ -372,7 +356,6 @@ class DocxTemplate(object):
                 )
 
             raise exc
-        # OPTIMIZED: Using pre-compiled pattern
         dst_xml = self._RE_PARAGRAPH_REMOVE_NEWLINE.sub(r"<w:p\1", dst_xml)
         dst_xml = (
             dst_xml.replace("{_{", "{{")
@@ -401,7 +384,6 @@ class DocxTemplate(object):
             "title",
             # 'version',
         ]
-        # OPTIMIZED: Use cached environment
         if jinja_env is None:
             jinja_env = _get_cached_env()
 
@@ -414,7 +396,6 @@ class DocxTemplate(object):
     def render_footnotes(
         self, context: Dict[str, Any], jinja_env: Optional[Environment] = None
     ) -> None:
-        # OPTIMIZED: Use cached environment
         if jinja_env is None:
             jinja_env = _get_cached_env()
 
@@ -458,28 +439,23 @@ class DocxTemplate(object):
             return xml
 
         def resolve_run(paragraph_properties, m):
-            # OPTIMIZED: Using pre-compiled pattern
             run_properties = self._RE_RUN_PROPS.search(m.group(0))
             run_properties = run_properties.group(0) if run_properties else ""
-            # OPTIMIZED: Using pre-compiled pattern
             return self._RE_RESOLVE_TEXT.sub(
                 lambda x: resolve_text(run_properties, paragraph_properties, x),
                 m.group(0),
             )
 
         def resolve_paragraph(m):
-            # OPTIMIZED: Using pre-compiled pattern
             paragraph_properties = self._RE_PARA_PROPS.search(m.group(0))
             paragraph_properties = (
                 paragraph_properties.group(0) if paragraph_properties else ""
             )
-            # OPTIMIZED: Using pre-compiled pattern
             return self._RE_RESOLVE_RUN.sub(
                 lambda x: resolve_run(paragraph_properties, x),
                 m.group(0),
             )
 
-        # OPTIMIZED: Using pre-compiled pattern
         xml = self._RE_RESOLVE_PARAGRAPH.sub(resolve_paragraph, xml)
 
         return xml
@@ -524,10 +500,17 @@ class DocxTemplate(object):
     def build_headers_footers_xml(self, context, uri, jinja_env=None):
         for relKey, part in self.get_headers_footers(uri):
             xml = self.get_part_xml(part)
-            encoding = self.get_headers_footers_encoding(xml)
-            xml = self.patch_xml(xml)
-            xml = self.render_xml_part(xml, part, context, jinja_env)
-            yield relKey, xml.encode(encoding)
+            
+            # Skip rendering if no Jinja tags present
+            # Headers/footers are often static, so this avoids caching/parsing overhead
+            if self._RE_JINJA_OPEN.search(xml) or self._RE_JINJA_CONTENT.search(xml):
+                encoding = self.get_headers_footers_encoding(xml)
+                xml = self.patch_xml(xml)
+                xml = self.render_xml_part(xml, part, context, jinja_env)
+                yield relKey, xml.encode(encoding)
+            else:
+                encoding = self.get_headers_footers_encoding(xml)
+                yield relKey, xml.encode(encoding)
 
     def map_headers_footers_xml(self, relKey, xml):
         part = self.docx._part.rels[relKey].target_part
@@ -545,7 +528,7 @@ class DocxTemplate(object):
         # init template working attributes
         self.render_init()
 
-        # OPTIMIZED: Use cached environment by default (avoids overhead of creating new env)
+        # Use cached environment by default
         if not jinja_env:
             jinja_env = _get_cached_env(autoescape=autoescape)
         elif autoescape:
@@ -581,24 +564,53 @@ class DocxTemplate(object):
         self.is_rendered = True
 
     # using of TC tag in for cycle can cause that count of columns does not
-    # correspond to real count of columns in row. This function is able to fix it.
+    # correspond to real count of columns in row.
     def fix_tables(self, xml):
-        # OPTIMIZED: Use parse_xml from docx.opc.oxml instead of etree.fromstring
-        # This ensures same document model and element classes, minimizing
-        # reconciliation cost when the tree is later used with map_tree()
-        tree = parse_xml(xml)
+        # Use parse_xml with safe fallback for malformed XML
+        try:
+            tree = parse_xml(xml)
+        except Exception:
+            # Fallback to permissive parser for malformed XML
+            parser = etree.XMLParser(recover=True)
+            tree = etree.fromstring(xml, parser=parser)
         # get namespace
         ns = "{" + tree.nsmap["w"] + "}"
         # walk trough xml and find table
         for t in tree.iter(ns + "tbl"):
             tblGrid = t.find(ns + "tblGrid")
+            if tblGrid is None:
+                continue
+                
             columns = tblGrid.findall(ns + "gridCol")
-            to_add = 0
-            # walk trough all rows and try to find if there is higher cell count
+            columns_len = len(columns)
+            
+            # Single pass row analysis with both counters
+            # Original logic uses raw count for ADD, effective count for REMOVE
+            max_raw_cells = 0       # For ADD decision (raw tc count)
+            max_effective_cells = 0  # For REMOVE decision (with gridSpan)
+            
             for r in t.iter(ns + "tr"):
                 cells = r.findall(ns + "tc")
-                if (len(columns) + to_add) < len(cells):
-                    to_add = len(cells) - len(columns)
+                raw_count = len(cells)
+                effective_count = 0
+                
+                for cell in cells:
+                    tc_pr = cell.find(ns + "tcPr")
+                    if tc_pr is not None:
+                        grid_span = tc_pr.find(ns + "gridSpan")
+                        if grid_span is not None:
+                            effective_count += int(grid_span.get(ns + "val"))
+                            continue
+                    effective_count += 1
+                
+                if raw_count > max_raw_cells:
+                    max_raw_cells = raw_count
+                if effective_count > max_effective_cells:
+                    max_effective_cells = effective_count
+            
+            # ADD columns based on RAW cell count (original behavior)
+            to_add = max_raw_cells - columns_len if max_raw_cells > columns_len else 0
+            
             # is necessary to add columns?
             if to_add > 0:
                 # at first, calculate width of table according to columns
@@ -620,34 +632,16 @@ class DocxTemplate(object):
                                 int(float(c.get(ns + "w")) * new_average / old_average)
                             ),
                         )
-                    # add new columns
+                    # add new columns using OxmlElement for proper python-docx compatibility
                     for i in range(to_add):
-                        etree.SubElement(
-                            tblGrid, ns + "gridCol", {ns + "w": str(int(new_average))}
-                        )
+                        new_col = OxmlElement('w:gridCol')
+                        new_col.set(qn('w:w'), str(int(new_average)))
+                        tblGrid.append(new_col)
 
-            # Refetch columns after columns addition.
+            # REMOVE columns based on EFFECTIVE cell count (original behavior)
             columns = tblGrid.findall(ns + "gridCol")
             columns_len = len(columns)
-
-            cells_len_max = 0
-
-            def get_cell_len(total, cell):
-                tc_pr = cell.find(ns + "tcPr")
-                grid_span = None if tc_pr is None else tc_pr.find(ns + "gridSpan")
-
-                if grid_span is not None:
-                    return total + int(grid_span.get(ns + "val"))
-
-                return total + 1
-
-            # Calculate max of table cells to compare with `gridCol`.
-            for r in t.iter(ns + "tr"):
-                cells = r.findall(ns + "tc")
-                cells_len = functools.reduce(get_cell_len, cells, 0)
-                cells_len_max = max(cells_len_max, cells_len)
-
-            to_remove = columns_len - cells_len_max
+            to_remove = columns_len - max_effective_cells if columns_len > max_effective_cells else 0
 
             # If after the loop, there're less columns, than
             # originally was, remove extra `gridCol` declarations.
@@ -676,8 +670,10 @@ class DocxTemplate(object):
         return tree
 
     def fix_docpr_ids(self, tree):
-        # some Ids may have some collisions : so renumbering all of them :
-        for elt in tree.xpath("//wp:docPr", namespaces=docx.oxml.ns.nsmap):
+        wp_ns = docx.oxml.ns.nsmap['wp']
+        tag = "{%s}docPr" % wp_ns
+        
+        for elt in tree.iter(tag):
             self.docx_ids_index += 1
             elt.attrib["id"] = str(self.docx_ids_index)
 
@@ -981,7 +977,6 @@ class DocxTemplate(object):
         if jinja_env:
             env = jinja_env
         else:
-            # OPTIMIZED: Use cached environment
             env = _get_cached_env()
 
         parse_content = env.parse(xml)
