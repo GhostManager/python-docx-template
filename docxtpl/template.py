@@ -469,7 +469,7 @@ class DocxTemplate(object):
     def map_tree(self, tree):
         """Replace body content with rendered tree.
         
-        OPTIMIZED: Instead of replacing the entire <w:body> element (which
+        Instead of replacing the entire <w:body> element with replace() (which
         triggers expensive reconciliation), we now mutate the body's children
         directly. This is much cheaper for large trees.
         """
@@ -568,9 +568,9 @@ class DocxTemplate(object):
     def fix_tables(self, xml):
         # Use parse_xml with safe fallback for malformed XML
         try:
-            tree = parse_xml(xml)
+            tree = parse_xml(xml) # parse_xml() is significantly faster
         except Exception:
-            # Fallback to permissive parser for malformed XML
+            # Fallback to permissive parser in the event of malformed XML
             parser = etree.XMLParser(recover=True)
             tree = etree.fromstring(xml, parser=parser)
         # get namespace
@@ -585,7 +585,6 @@ class DocxTemplate(object):
             columns_len = len(columns)
             
             # Single pass row analysis with both counters
-            # Original logic uses raw count for ADD, effective count for REMOVE
             max_raw_cells = 0       # For ADD decision (raw tc count)
             max_effective_cells = 0  # For REMOVE decision (with gridSpan)
             
@@ -670,6 +669,7 @@ class DocxTemplate(object):
         return tree
 
     def fix_docpr_ids(self, tree):
+        # Some Ids may have some collisions : so renumbering all of them
         wp_ns = docx.oxml.ns.nsmap['wp']
         tag = "{%s}docPr" % wp_ns
         
