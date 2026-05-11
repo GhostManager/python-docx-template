@@ -42,7 +42,10 @@ repository = "https://github.com/elapouya/python-docx-template.git"
 document = "https://docxtpl.readthedocs.org"
 
 [tool.poetry]
+name = "docxtpl"
 version = "0.0.0"
+description = "Python docx template engine"
+authors = ["Eric Lapouyade <elapouya@proton.me>"]
 
 [tool.poetry.requires-plugins]
 poetry-dynamic-versioning = { version = ">=1.0.0,<2.0.0", extras = ["plugin"] }
