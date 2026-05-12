@@ -18,8 +18,11 @@ import docx.oxml.ns
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE as REL_TYPE
+import logging
 from jinja2 import Environment, Template, meta
 from jinja2.exceptions import TemplateError
+
+logger = logging.getLogger(__name__)
 
 
 def _create_optimized_env(**kwargs):
@@ -129,6 +132,10 @@ class DocxTemplate(object):
     _RE_RESOLVE_TEXT = re.compile(r"<w:t(?: [^>]*)?>.*?</w:t>", re.DOTALL)
     _RE_RUN_PROPS = re.compile(r"<w:rPr>.*?</w:rPr>")
     _RE_PARA_PROPS = re.compile(r"<w:pPr>.*?</w:pPr>")
+
+    # Precompiled pattern for fast detection of any Jinja syntax in a string.
+    # Used in render() to skip header/footer processing when no tags are present.
+    _JINJA_PATTERN = re.compile(r'\{\{|\{%|\{#')
 
     def __init__(self, template_file: Union[IO[bytes], str, PathLike]) -> None:
         self.template_file = template_file
@@ -467,21 +474,54 @@ class DocxTemplate(object):
         return xml
 
     def map_tree(self, tree):
-        """Replace body content with rendered tree.
-        
-        Instead of replacing the entire <w:body> element with replace() (which
-        triggers expensive reconciliation), we now mutate the body's children
-        directly. This is much cheaper for large trees.
+        """Replace the body element with the rendered tree.
+
+        Uses root.remove() + root.insert(index) instead of root.replace() to
+        avoid lxml's O(n) recursive cleanup on large XML trees.  The body
+        index is located first so document element order (body before sectPr)
+        is preserved.
+
+        SAFETY: If the body is not a direct child of root (malformed template)
+        or if remove/insert raises for any reason, we fall back to copying
+        children so rendering is never broken by this optimisation.
         """
-        body = self.docx._element.body
-        
-        # Remove all existing children from body
-        for child in list(body):
-            body.remove(child)
-        
-        # Append all children from the new tree
-        for child in list(tree):
-            body.append(child)
+        root = self.docx._element
+        old_body = root.body
+
+        # Locate the body's position among root's direct children.
+        body_index = None
+        for i, child in enumerate(root):
+            if child is old_body:
+                body_index = i
+                break
+
+        if body_index is None:
+            # Malformed template – body is not a direct child; fall back.
+            logger.warning(
+                "map_tree: body is not a direct child of root (malformed template?). "
+                "Falling back to child-copy implementation."
+            )
+            for child in list(old_body):
+                old_body.remove(child)
+            for child in list(tree):
+                old_body.append(child)
+            return
+
+        try:
+            root.remove(old_body)
+            root.insert(body_index, tree)
+        except Exception:
+            logger.warning(
+                "map_tree: optimized remove/insert failed; falling back to child-copy.",
+                exc_info=True,
+            )
+            # Re-attach old_body if it was already removed before the failure.
+            if old_body.getparent() is None:
+                root.insert(body_index, old_body)
+            for child in list(old_body):
+                old_body.remove(child)
+            for child in list(tree):
+                old_body.append(child)
 
     def get_headers_footers(self, uri):
         for relKey, val in self.docx._part.rels.items():
@@ -546,15 +586,26 @@ class DocxTemplate(object):
         # Replace body xml tree
         self.map_tree(tree)
 
-        # Headers
-        headers = self.build_headers_footers_xml(context, self.HEADER_URI, jinja_env)
-        for relKey, xml in headers:
-            self.map_headers_footers_xml(relKey, xml)
-
-        # Footers
-        footers = self.build_headers_footers_xml(context, self.FOOTER_URI, jinja_env)
-        for relKey, xml in footers:
-            self.map_headers_footers_xml(relKey, xml)
+        # Headers & Footers – skip entirely when no Jinja tags are present to
+        # avoid unnecessary XML parsing, patch_xml, and part replacement.
+        for uri in (self.HEADER_URI, self.FOOTER_URI):
+            try:
+                has_jinja = any(
+                    self._JINJA_PATTERN.search(self.get_part_xml(part))
+                    for _relKey, part in self.get_headers_footers(uri)
+                )
+                if has_jinja:
+                    for relKey, xml in self.build_headers_footers_xml(context, uri, jinja_env):
+                        self.map_headers_footers_xml(relKey, xml)
+            except Exception:
+                logger.warning(
+                    "render: header/footer Jinja-tag check failed for %s; "
+                    "falling back to full processing.",
+                    uri,
+                    exc_info=True,
+                )
+                for relKey, xml in self.build_headers_footers_xml(context, uri, jinja_env):
+                    self.map_headers_footers_xml(relKey, xml)
 
         self.render_properties(context, jinja_env)
 
