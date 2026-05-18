@@ -125,8 +125,10 @@ class InlineImage(object):
             image_part, image = self.tpl._get_or_add_image_part(image_descriptor)
             rId = part.relate_to(image_part, RT.IMAGE)
             cx, cy = image.scaled_dimensions(self.width, self.height)
-            # Escape for use inside XML attribute (quotes must be escaped)
-            filename = xml_escape(image.filename, {'"': "&quot;"})
+            # Escape for use inside XML attribute (quotes must be escaped).
+            # image.filename is None for file-like descriptors (BytesIO);
+            # normalize to empty string to match python-docx's behavior.
+            filename = xml_escape(image.filename or "", {'"': "&quot;"})
             cache[cache_key] = (rId, int(cx), int(cy), filename)
 
         # Always assign a fresh shape_id per insertion so that drawing IDs
