@@ -419,6 +419,10 @@ class DocxTemplate(object):
                     part._blob = xml.encode("utf-8")
 
     def resolve_listing(self, xml):
+        # Early exit: if no Listing special characters are present (common case),
+        # there's nothing to resolve, skip the work below.
+        if "\t" not in xml and "\n" not in xml and "\a" not in xml and "\f" not in xml:
+            return xml
 
         def resolve_text(run_properties, paragraph_properties, m):
             xml = m.group(0).replace(
