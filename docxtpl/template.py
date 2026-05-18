@@ -474,19 +474,24 @@ class DocxTemplate(object):
     def map_tree(self, tree):
         """Replace the body element with the rendered tree.
 
-        Uses root.remove() + root.insert(index) instead of root.replace() to
-        avoid lxml's O(n) recursive cleanup on large XML trees.  The body
-        index is located first so document element order (body before sectPr)
-        is preserved.
+        Instead of iterating over all body children to remove/re-append them
+        one-by-one (O(n) lxml operations, each with internal bookkeeping),
+        we swap the entire <w:body> element in the document root using
+        root.remove() + root.insert(). This is O(1) since the root element
+        (<w:document>) has only a handful of direct children.
+
+        The body's index is located first so document element order is
+        preserved (e.g. body before sectPr).
 
         SAFETY: If the body is not a direct child of root (malformed template)
-        or if remove/insert raises for any reason, we fall back to copying
-        children so rendering is never broken by this optimisation.
+        or if remove/insert raises for any reason, we fall back to the slower
+        child-by-child copy so rendering is never broken.
         """
         root = self.docx._element
         old_body = root.body
 
-        # Locate the body's position among root's direct children.
+        # Find where <w:body> sits among root's direct children so we can
+        # re-insert the new tree at the same position.
         body_index = None
         for i, child in enumerate(root):
             if child is old_body:
@@ -494,7 +499,8 @@ class DocxTemplate(object):
                 break
 
         if body_index is None:
-            # Malformed template – body is not a direct child; fall back.
+            # Malformed template – body is not a direct child of root.
+            # Fall back to child-by-child replacement on the existing body.
             for child in list(old_body):
                 old_body.remove(child)
             for child in list(tree):
@@ -502,10 +508,15 @@ class DocxTemplate(object):
             return
 
         try:
+            # Detach the old body and insert the new tree (which is itself a
+            # <w:body> element returned by fix_tables/parse_xml) at the same
+            # position. This avoids O(n) per-child remove/append calls.
             root.remove(old_body)
             root.insert(body_index, tree)
         except Exception:
-            # Re-attach old_body if it was already removed before the failure.
+            # If something went wrong, restore the document to a usable state
+            # by re-attaching the old body (if it was already detached) and
+            # falling back to child-by-child copy.
             if old_body.getparent() is None:
                 root.insert(body_index, old_body)
             for child in list(old_body):
