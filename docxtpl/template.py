@@ -601,7 +601,7 @@ class DocxTemplate(object):
 
         # Headers & Footers - skip when no Jinja tags are present.
         # Uses both _JINJA_PATTERN (intact tags) and _RE_JINJA_OPEN (tags
-        # split across XML runs by Word). Falls back to full render on error.
+        # split across XML runs by Word).
         for uri in (self.HEADER_URI, self.FOOTER_URI):
             try:
                 has_jinja = any(
@@ -616,8 +616,9 @@ class DocxTemplate(object):
                     for relKey, xml in self.build_headers_footers_xml(context, uri, jinja_env):
                         self.map_headers_footers_xml(relKey, xml)
             except Exception:
-                # Fallback: if the fast-path check raises (e.g. malformed XML
-                # in a part), process all headers/footers unconditionally.
+                # Fallback: guards against unexpected part structure (e.g. blob
+                # is None, missing attributes). Not malformed XML - that would
+                # fail in build_headers_footers_xml regardless.
                 for relKey, xml in self.build_headers_footers_xml(context, uri, jinja_env):
                     self.map_headers_footers_xml(relKey, xml)
 
