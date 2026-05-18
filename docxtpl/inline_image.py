@@ -112,12 +112,16 @@ class InlineImage(object):
         # cached because each insertion needs a unique shape_id - header/footer
         # and footnote parts are not renumbered by fix_docpr_ids().
         cache = self.tpl._image_cache
-        # Use id() for non-hashable descriptors (file-like objects) to avoid
-        # TypeError on dict lookup.
-        desc_key = image_descriptor if isinstance(image_descriptor, str) else id(image_descriptor)
-        cache_key = (id(part), desc_key, self.width, self.height)
+        # For hashable descriptors (strings, paths), cache by value.
+        # For unhashable descriptors (file-like objects), skip caching
+        # entirely — using id() would risk aliasing after GC.
+        try:
+            cache_key = (id(part), image_descriptor, self.width, self.height)
+            hash(cache_key) is not None  # trigger TypeError if unhashable
+        except TypeError:
+            cache_key = None
 
-        if cache_key in cache:
+        if cache_key is not None and cache_key in cache:
             rId, cx, cy, filename = cache[cache_key]
         else:
             # Get or add the image part with O(1) descriptor-based dedup,
@@ -129,7 +133,8 @@ class InlineImage(object):
             # image.filename is None for file-like descriptors (BytesIO);
             # normalize to empty string to match python-docx's behavior.
             filename = xml_escape(image.filename or "", {'"': "&quot;"})
-            cache[cache_key] = (rId, int(cx), int(cy), filename)
+            if cache_key is not None:
+                cache[cache_key] = (rId, int(cx), int(cy), filename)
 
         # Always assign a fresh shape_id per insertion so that drawing IDs
         # are unique in every part (including headers/footers/footnotes
