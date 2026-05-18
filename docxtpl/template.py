@@ -170,10 +170,48 @@ class DocxTemplate(object):
         self.init_docx()
         self.pic_map = {}
         self.current_rendering_part = None
-        self.docx_ids_index = 1000
         self._image_cache = {}
         self.is_saved = False
         self._init_image_parts_index()
+        self._init_docx_ids_index()
+
+    def _init_docx_ids_index(self):
+        """Set docx_ids_index above the maximum existing wp:docPr id.
+
+        fix_docpr_ids() only renumbers the body tree, so IDs in headers,
+        footers, and footnotes retain their original values. Starting the
+        counter above the global maximum prevents collisions when inserting
+        new drawings into any part.
+        """
+        import docx.oxml.ns as _ns
+        wp_ns = _ns.nsmap['wp']
+        tag = "{%s}docPr" % wp_ns
+        max_id = 0
+
+        # Scan all parts (body + headers + footers + footnotes)
+        for part in self.docx._part._package.parts:
+            if not hasattr(part, 'blob') or part.blob is None:
+                continue
+            # Only scan XML parts that could contain drawings
+            ct = getattr(part, 'content_type', '')
+            if not ct.startswith('application/vnd.openxmlformats-officedocument'):
+                continue
+            try:
+                tree = etree.fromstring(part.blob)
+            except Exception:
+                continue
+            for elt in tree.iter(tag):
+                id_val = elt.get('id')
+                if id_val is not None:
+                    try:
+                        val = int(id_val)
+                        if val > max_id:
+                            max_id = val
+                    except ValueError:
+                        pass
+
+        # Start above the highest existing ID (minimum 1000 for safety)
+        self.docx_ids_index = max(max_id, 1000)
 
     def _init_image_parts_index(self):
         """Initialize image-part tracking for fast insertion.
