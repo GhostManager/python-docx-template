@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from os import PathLike
 from typing import TYPE_CHECKING, Any, Optional, IO, Union, Dict, Set
-import functools
 import io
 from lxml import etree
 from docx import Document
@@ -18,8 +17,7 @@ import docx.oxml.ns
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE as REL_TYPE
-import logging
-from jinja2 import Environment, Template, meta
+from jinja2 import Environment, meta
 from jinja2.exceptions import TemplateError
 
 
