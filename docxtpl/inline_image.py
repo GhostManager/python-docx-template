@@ -115,11 +115,10 @@ class InlineImage(object):
         if cache_key in cache:
             pic = cache[cache_key]
         else:
-            # Get or add the image part (handles deduplication via SHA1 internally)
-            package = part._package
-            image_part = package.get_or_add_image_part(image_descriptor)
+            # Get or add the image part with O(1) SHA1 deduplication,
+            # avoiding the O(n) linear scan and SHA1 recomputation per lookup.
+            image_part, image = self.tpl._get_or_add_image_part(image_descriptor)
             rId = part.relate_to(image_part, RT.IMAGE)
-            image = image_part.image
             cx, cy = image.scaled_dimensions(self.width, self.height)
 
             # Assign shape_id from a simple counter. python-docx's

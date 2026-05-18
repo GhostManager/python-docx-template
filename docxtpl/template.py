@@ -173,6 +173,61 @@ class DocxTemplate(object):
         self.docx_ids_index = 1000
         self._image_cache = {}
         self.is_saved = False
+        self._init_image_parts_index()
+
+    def _init_image_parts_index(self):
+        """Build an O(1) SHA1 index of existing image parts in the package.
+
+        This enables fast deduplication in _get_or_add_image_part(), avoiding
+        the O(n) linear scan and repeated SHA1 recomputation that occurs in
+        the default python-docx image-part lookup.
+        """
+        package = self.docx._part._package
+        image_parts = package.image_parts
+
+        # Seed the index from existing image parts in the template.
+        # ImagePart.sha1 recomputes on each access, but this is a one-time
+        # cost for the (typically few) images already in the template.
+        self._image_sha1_index = {}
+        for ip in image_parts:
+            self._image_sha1_index[ip.sha1] = ip
+
+        # Start the partname counter after all existing image parts to avoid
+        # collisions with partnames already in the package.
+        self._image_part_counter = len(image_parts._image_parts)
+
+    def _get_or_add_image_part(self, image_descriptor):
+        """Return (image_part, image) for the given image_descriptor.
+
+        Performs the same function as python-docx's
+        Package.get_or_add_image_part() but with O(1) SHA1 deduplication
+        (instead of O(n) linear scan with repeated SHA1 recomputation) and
+        sequential partname assignment (instead of O(n²) gap-search).
+        """
+        from docx.image.image import Image
+        from docx.opc.packuri import PackURI
+        from docx.parts.image import ImagePart
+
+        image = Image.from_file(image_descriptor)
+        sha1 = image.sha1  # @lazyproperty — computed once per Image object
+
+        image_part = self._image_sha1_index.get(sha1)
+        if image_part is not None:
+            return image_part, image
+
+        # New unique image — create part with sequential partname
+        self._image_part_counter += 1
+        partname = PackURI(
+            "/word/media/image%d.%s" % (self._image_part_counter, image.ext)
+        )
+        image_part = ImagePart.from_image(image, partname)
+
+        # Add to the package collection and the SHA1 index
+        package = self.docx._part._package
+        package.image_parts.append(image_part)
+        self._image_sha1_index[sha1] = image_part
+
+        return image_part, image
 
     def __getattr__(self, name):
         return getattr(self.docx, name)
