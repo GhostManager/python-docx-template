@@ -188,9 +188,19 @@ class DocxTemplate(object):
         # This is the primary dedup mechanism and avoids expensive content hashing.
         self._image_descriptor_index = {}
 
-        # Start the partname counter after all existing image parts to avoid
-        # collisions with partnames already in the package.
-        self._image_part_counter = len(image_parts._image_parts)
+        # Derive the next partname index by scanning existing partnames once.
+        # Using len() alone would collide with non-contiguous numbering
+        # (e.g. image1.png + image3.png → len=2 → next would be image3.ext).
+        max_index = 0
+        for ip in image_parts:
+            # Partnames follow /word/media/imageN.ext pattern
+            name = ip.partname.baseURI if hasattr(ip.partname, 'baseURI') else str(ip.partname)
+            m = re.search(r'/image(\d+)\.', name)
+            if m:
+                idx = int(m.group(1))
+                if idx > max_index:
+                    max_index = idx
+        self._image_part_counter = max_index
 
     def _get_or_add_image_part(self, image_descriptor):
         """Return (image_part, image) for the given image_descriptor.
