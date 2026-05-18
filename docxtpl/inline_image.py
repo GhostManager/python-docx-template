@@ -107,38 +107,39 @@ class InlineImage(object):
         part = self.tpl.current_rendering_part
         image_descriptor = self.image_descriptor
 
-        # Cache generated XML per (part, descriptor, width, height) to avoid
-        # repeated file I/O, image hashing, and header parsing.
+        # Cache the expensive parts (image part lookup, rId, dimensions) per
+        # (part, descriptor, width, height).  The XML string itself is NOT
+        # cached because each insertion needs a unique shape_id - header/footer
+        # and footnote parts are not renumbered by fix_docpr_ids().
         cache = self.tpl._image_cache
         cache_key = (id(part), image_descriptor, self.width, self.height)
 
         if cache_key in cache:
-            pic = cache[cache_key]
+            rId, cx, cy, filename = cache[cache_key]
         else:
             # Get or add the image part with O(1) descriptor-based dedup,
             # avoiding the O(n) linear scan in python-docx's default path.
             image_part, image = self.tpl._get_or_add_image_part(image_descriptor)
             rId = part.relate_to(image_part, RT.IMAGE)
             cx, cy = image.scaled_dimensions(self.width, self.height)
+            filename = xml_escape(image.filename)
+            cache[cache_key] = (rId, int(cx), int(cy), filename)
 
-            # Assign shape_id from a simple counter. python-docx's
-            # new_pic_inline() would call its next_id property which does an
-            # XPath("//@id") over the entire XML tree on every call - but we
-            # bypass that entirely by generating the XML ourselves.
-            # fix_docpr_ids() renumbers all IDs after rendering anyway.
-            self.tpl.docx_ids_index += 1
-            shape_id = self.tpl.docx_ids_index
+        # Always assign a fresh shape_id per insertion so that drawing IDs
+        # are unique in every part (including headers/footers/footnotes
+        # which are not renumbered by fix_docpr_ids()).
+        self.tpl.docx_ids_index += 1
+        shape_id = self.tpl.docx_ids_index
 
-            # Generate XML directly as a string using a pre-built template
-            # rather than calling CT_Inline.new_pic_inline() per image.
-            pic = _INLINE_IMAGE_XML.format(
-                cx=int(cx),
-                cy=int(cy),
-                shape_id=shape_id,
-                filename=xml_escape(image.filename),
-                rId=rId,
-            )
-            cache[cache_key] = pic
+        # Generate XML directly as a string using a pre-built template
+        # rather than calling CT_Inline.new_pic_inline() per image.
+        pic = _INLINE_IMAGE_XML.format(
+            cx=int(cx),
+            cy=int(cy),
+            shape_id=shape_id,
+            filename=filename,
+            rId=rId,
+        )
 
         if self.anchor:
             run = parse_xml(pic)
