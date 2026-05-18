@@ -4,8 +4,62 @@ Created : 2021-07-30
 
 @author: Eric Lapouyade
 """
+from xml.sax.saxutils import escape as xml_escape
+
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
 from docx.oxml import OxmlElement, parse_xml
 from docx.oxml.ns import qn
+from docx.oxml.shape import CT_Inline
+from docx.shared import Emu
+
+
+def _build_inline_image_xml_template():
+    """Generate the XML format string by calling python-docx with sentinel values.
+
+    This ensures the template always matches the installed python-docx version's
+    XML structure, even after upgrades. We call CT_Inline.new_pic_inline() once
+    with recognizable sentinel values, serialize to XML, then replace the
+    sentinels with Python format placeholders.
+    """
+    import uuid
+
+    # Use GUIDs for string sentinels - guaranteed no collision with XML content
+    _RID_SENTINEL = str(uuid.uuid4())
+    _FILENAME_SENTINEL = str(uuid.uuid4())
+
+    # For numeric sentinels, use unique integers derived from UUIDs.
+    # shape_id is xsd:unsignedInt (max 4,294,967,295 / 32-bit).
+    # cx/cy are EMU values typed as xsd:long (64-bit).
+    # All use 9-digit range [100000000, 999999999] to stay within 32-bit
+    # and avoid any accidental collisions with each other.
+    _SHAPE_ID = uuid.uuid4().int % (9 * 10**8) + 10**8
+    _CX_INT = uuid.uuid4().int % (9 * 10**8) + 10**8
+    _CY_INT = uuid.uuid4().int % (9 * 10**8) + 10**8
+
+    inline = CT_Inline.new_pic_inline(
+        _SHAPE_ID,
+        _RID_SENTINEL,
+        _FILENAME_SENTINEL,
+        Emu(_CX_INT),
+        Emu(_CY_INT),
+    )
+    xml = inline.xml
+
+    # Replace sentinel values with format string placeholders
+    xml = xml.replace(str(_SHAPE_ID), "{shape_id}")
+    xml = xml.replace(_RID_SENTINEL, "{rId}")
+    xml = xml.replace(_FILENAME_SENTINEL, "{filename}")
+    xml = xml.replace(str(_CX_INT), "{cx}")
+    xml = xml.replace(str(_CY_INT), "{cy}")
+
+    return xml
+
+
+# Pre-built XML template for inline images, derived from the installed
+# python-docx version. Using str.format() on this template avoids calling
+# CT_Inline.new_pic_inline() per image (which does 2x parse_xml() +
+# element manipulation + .xml serialization each time).
+_INLINE_IMAGE_XML = _build_inline_image_xml_template()
 
 
 class InlineImage(object):
@@ -50,16 +104,59 @@ class InlineImage(object):
         return run
 
     def _insert_image(self):
-        pic = self.tpl.current_rendering_part.new_pic_inline(
-            self.image_descriptor,
-            self.width,
-            self.height,
-        ).xml
+        part = self.tpl.current_rendering_part
+        image_descriptor = self.image_descriptor
+
+        # Cache the expensive parts (image part lookup, rId, dimensions) per
+        # (part, descriptor, width, height).  The XML string itself is NOT
+        # cached because each insertion needs a unique shape_id - header/footer
+        # and footnote parts are not renumbered by fix_docpr_ids().
+        cache = self.tpl._image_cache
+        # For hashable descriptors (strings, paths), cache by value.
+        # For unhashable descriptors (file-like objects), skip caching
+        # entirely — using id() would risk aliasing after GC.
+        try:
+            cache_key = (id(part), image_descriptor, self.width, self.height)
+            hash(cache_key) is not None  # trigger TypeError if unhashable
+        except TypeError:
+            cache_key = None
+
+        if cache_key is not None and cache_key in cache:
+            rId, cx, cy, filename = cache[cache_key]
+        else:
+            # Get or add the image part with O(1) descriptor-based dedup,
+            # avoiding the O(n) linear scan in python-docx's default path.
+            image_part, image = self.tpl._get_or_add_image_part(image_descriptor)
+            rId = part.relate_to(image_part, RT.IMAGE)
+            cx, cy = image.scaled_dimensions(self.width, self.height)
+            # Escape for use inside XML attribute (quotes must be escaped).
+            # image.filename is None for file-like descriptors (BytesIO);
+            # normalize to empty string to match python-docx's behavior.
+            filename = xml_escape(image.filename or "", {'"': "&quot;"})
+            if cache_key is not None:
+                cache[cache_key] = (rId, int(cx), int(cy), filename)
+
+        # Always assign a fresh shape_id per insertion so that drawing IDs
+        # are unique in every part (including headers/footers/footnotes
+        # which are not renumbered by fix_docpr_ids()).
+        self.tpl.docx_ids_index += 1
+        shape_id = self.tpl.docx_ids_index
+
+        # Generate XML directly as a string using a pre-built template
+        # rather than calling CT_Inline.new_pic_inline() per image.
+        pic = _INLINE_IMAGE_XML.format(
+            cx=int(cx),
+            cy=int(cy),
+            shape_id=shape_id,
+            filename=filename,
+            rId=rId,
+        )
+
         if self.anchor:
             run = parse_xml(pic)
             if run.xpath(".//a:blip"):
                 hyperlink = self._add_hyperlink(
-                    run, self.anchor, self.tpl.current_rendering_part
+                    run, self.anchor, part
                 )
                 pic = hyperlink.xml
 

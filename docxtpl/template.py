@@ -170,8 +170,113 @@ class DocxTemplate(object):
         self.init_docx()
         self.pic_map = {}
         self.current_rendering_part = None
-        self.docx_ids_index = 1000
+        self._image_cache = {}
         self.is_saved = False
+        self._init_image_parts_index()
+        self._init_docx_ids_index()
+
+    def _init_docx_ids_index(self):
+        """Set docx_ids_index above the maximum existing wp:docPr id.
+
+        fix_docpr_ids() only renumbers the body tree, so IDs in headers,
+        footers, and footnotes retain their original values. Starting the
+        counter above the global maximum prevents collisions when inserting
+        new drawings into any part.
+        """
+        import docx.oxml.ns as _ns
+        wp_ns = _ns.nsmap['wp']
+        tag = "{%s}docPr" % wp_ns
+        max_id = 0
+
+        # Scan all parts (body + headers + footers + footnotes)
+        for part in self.docx._part._package.parts:
+            if not hasattr(part, 'blob') or part.blob is None:
+                continue
+            # Only scan XML parts that could contain drawings
+            ct = getattr(part, 'content_type', '')
+            if not ct.startswith('application/vnd.openxmlformats-officedocument'):
+                continue
+            try:
+                tree = etree.fromstring(part.blob)
+            except Exception:
+                continue
+            for elt in tree.iter(tag):
+                id_val = elt.get('id')
+                if id_val is not None:
+                    try:
+                        val = int(id_val)
+                        if val > max_id:
+                            max_id = val
+                    except ValueError:
+                        pass
+
+        # Start above the highest existing ID (minimum 1000 for safety)
+        self.docx_ids_index = max(max_id, 1000)
+
+    def _init_image_parts_index(self):
+        """Initialize image-part tracking for fast insertion.
+
+        Uses a descriptor-keyed cache (file path string) for O(1) dedup of
+        images added during rendering, avoiding expensive content hashing.
+        """
+        package = self.docx._part._package
+        image_parts = package.image_parts
+
+        # Descriptor-keyed cache: maps image_descriptor -> (image_part, image)
+        # This is the primary dedup mechanism and avoids expensive content hashing.
+        self._image_descriptor_index = {}
+
+        # Derive the next partname index by scanning existing partnames once.
+        # Using len() alone would collide with non-contiguous numbering
+        # (e.g. image1.png + image3.png → len=2 → next would be image3.ext).
+        max_index = 0
+        for ip in image_parts:
+            # Partnames follow /word/media/imageN.ext pattern
+            name = str(ip.partname)
+            m = re.search(r'/image(\d+)\.', name)
+            if m:
+                idx = int(m.group(1))
+                if idx > max_index:
+                    max_index = idx
+        self._image_part_counter = max_index
+
+    def _get_or_add_image_part(self, image_descriptor):
+        """Return (image_part, image) for the given image_descriptor.
+
+        Uses the descriptor itself (file path) as the dedup key, avoiding
+        expensive content hashing.  Falls back to always creating a new part
+        for non-hashable descriptors (file-like objects).
+        """
+        from docx.image.image import Image
+        from docx.opc.packuri import PackURI
+        from docx.parts.image import ImagePart
+
+        # For string paths, use the path as a cheap dedup key.
+        cache_key = image_descriptor if isinstance(image_descriptor, str) else None
+
+        if cache_key is not None:
+            cached = self._image_descriptor_index.get(cache_key)
+            if cached is not None:
+                return cached
+
+        image = Image.from_file(image_descriptor)
+
+        # Create image part with sequential partname
+        self._image_part_counter += 1
+        partname = PackURI(
+            "/word/media/image%d.%s" % (self._image_part_counter, image.ext)
+        )
+        image_part = ImagePart.from_image(image, partname)
+
+        # Add to the package collection
+        package = self.docx._part._package
+        package.image_parts.append(image_part)
+
+        result = (image_part, image)
+        if cache_key is not None:
+            self._image_descriptor_index[cache_key] = result
+
+        return result
 
     def __getattr__(self, name):
         return getattr(self.docx, name)
