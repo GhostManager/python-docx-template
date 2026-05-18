@@ -112,7 +112,10 @@ class InlineImage(object):
         # cached because each insertion needs a unique shape_id - header/footer
         # and footnote parts are not renumbered by fix_docpr_ids().
         cache = self.tpl._image_cache
-        cache_key = (id(part), image_descriptor, self.width, self.height)
+        # Use id() for non-hashable descriptors (file-like objects) to avoid
+        # TypeError on dict lookup.
+        desc_key = image_descriptor if isinstance(image_descriptor, str) else id(image_descriptor)
+        cache_key = (id(part), desc_key, self.width, self.height)
 
         if cache_key in cache:
             rId, cx, cy, filename = cache[cache_key]
@@ -122,7 +125,8 @@ class InlineImage(object):
             image_part, image = self.tpl._get_or_add_image_part(image_descriptor)
             rId = part.relate_to(image_part, RT.IMAGE)
             cx, cy = image.scaled_dimensions(self.width, self.height)
-            filename = xml_escape(image.filename)
+            # Escape for use inside XML attribute (quotes must be escaped)
+            filename = xml_escape(image.filename, {'"': "&quot;"})
             cache[cache_key] = (rId, int(cx), int(cy), filename)
 
         # Always assign a fresh shape_id per insertion so that drawing IDs
