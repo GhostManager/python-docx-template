@@ -171,6 +171,7 @@ class DocxTemplate(object):
         self.pic_map = {}
         self.current_rendering_part = None
         self.docx_ids_index = 1000
+        self._image_cache = {}
         self.is_saved = False
 
     def __getattr__(self, name):
