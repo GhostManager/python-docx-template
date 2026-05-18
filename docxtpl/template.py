@@ -131,6 +131,26 @@ class DocxTemplate(object):
     _RE_RUN_PROPS = re.compile(r"<w:rPr>.*?</w:rPr>")
     _RE_PARA_PROPS = re.compile(r"<w:pPr>.*?</w:pPr>")
 
+    # Pre-compiled patterns for tag-stripping in patch_xml().
+    # Strips surrounding <w:y> tags from {%y ...%} / {{y ...}} template tags.
+    _RE_TAG_STRIP = tuple(
+        re.compile(
+            r"<w:%s[ >](?:(?!<w:%s[ >]).)*({%%|{{)%s ([^}%%]*(?:%%}|}})).*?</w:%s>"
+            % (y, y, y, y),
+            re.DOTALL,
+        )
+        for y in ("tr", "tc", "p", "r")
+    )
+    # Same for {#y ...#} comment tags (not 'r' - comments in runs are uncommon).
+    _RE_COMMENT_STRIP = tuple(
+        re.compile(
+            r"<w:%s[ >](?:(?!<w:%s[ >]).)*({#)%s ([^}#]*(?:#})).*?</w:%s>"
+            % (y, y, y, y),
+            re.DOTALL,
+        )
+        for y in ("tr", "tc", "p")
+    )
+
     # Precompiled pattern for fast detection of any Jinja syntax in a string.
     # Used in render() to skip header/footer processing when no tags are present.
     _JINJA_PATTERN = re.compile(r'\{\{|\{%|\{#')
@@ -229,25 +249,15 @@ class DocxTemplate(object):
         # -%} will merge with next paragraph text
         src_xml = self._RE_MERGE_NEXT.sub("%}", src_xml)
 
-        for y in ["tr", "tc", "p", "r"]:
-            # replace into xml code the row/paragraph/run containing
-            # {%y xxx %} or {{y xxx}} template tag
-            # by {% xxx %} or {{ xx }} without any surrounding <w:y> tags :
-            # This is mandatory to have jinja2 generating correct xml code
-            pat = (
-                r"<w:%(y)s[ >](?:(?!<w:%(y)s[ >]).)*({%%|{{)%(y)s ([^}%%]*(?:%%}|}})).*?</w:%(y)s>"
-                % {"y": y}
-            )
-            src_xml = re.sub(pat, r"\1 \2", src_xml, flags=re.DOTALL)
+        # Strip surrounding <w:y> tags from {%y ...%} / {{y ...}} template tags.
+        # This is mandatory for jinja2 to generate correct xml code.
+        # Patterns are pre-compiled as class attributes to avoid recompilation.
+        for pat in self._RE_TAG_STRIP:
+            src_xml = pat.sub(r"\1 \2", src_xml)
 
-        for y in ["tr", "tc", "p"]:
-            # same thing, but for {#y xxx #} (but not where y == 'r', since that
-            # makes less sense to use comments in that context
-            pat = (
-                r"<w:%(y)s[ >](?:(?!<w:%(y)s[ >]).)*({#)%(y)s ([^}#]*(?:#})).*?</w:%(y)s>"
-                % {"y": y}
-            )
-            src_xml = re.sub(pat, r"\1 \2", src_xml, flags=re.DOTALL)
+        # Same for {#y ...#} comment tags (not 'r' — comments in runs are uncommon).
+        for pat in self._RE_COMMENT_STRIP:
+            src_xml = pat.sub(r"\1 \2", src_xml)
 
         # add vMerge
         # use {% vm %} to make this table cell and its copies
