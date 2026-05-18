@@ -108,15 +108,15 @@ class InlineImage(object):
         image_descriptor = self.image_descriptor
 
         # Cache generated XML per (part, descriptor, width, height) to avoid
-        # repeated file I/O, SHA1 computation, and header parsing.
+        # repeated file I/O, image hashing, and header parsing.
         cache = self.tpl._image_cache
         cache_key = (id(part), image_descriptor, self.width, self.height)
 
         if cache_key in cache:
             pic = cache[cache_key]
         else:
-            # Get or add the image part with O(1) SHA1 deduplication,
-            # avoiding the O(n) linear scan and SHA1 recomputation per lookup.
+            # Get or add the image part with O(1) descriptor-based dedup,
+            # avoiding the O(n) linear scan in python-docx's default path.
             image_part, image = self.tpl._get_or_add_image_part(image_descriptor)
             rId = part.relate_to(image_part, RT.IMAGE)
             cx, cy = image.scaled_dimensions(self.width, self.height)

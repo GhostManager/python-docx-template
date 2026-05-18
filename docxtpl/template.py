@@ -176,21 +176,17 @@ class DocxTemplate(object):
         self._init_image_parts_index()
 
     def _init_image_parts_index(self):
-        """Build an O(1) SHA1 index of existing image parts in the package.
+        """Initialize image-part tracking for fast insertion.
 
-        This enables fast deduplication in _get_or_add_image_part(), avoiding
-        the O(n) linear scan and repeated SHA1 recomputation that occurs in
-        the default python-docx image-part lookup.
+        Uses a descriptor-keyed cache (file path string) for O(1) dedup of
+        images added during rendering, avoiding expensive content hashing.
         """
         package = self.docx._part._package
         image_parts = package.image_parts
 
-        # Seed the index from existing image parts in the template.
-        # ImagePart.sha1 recomputes on each access, but this is a one-time
-        # cost for the (typically few) images already in the template.
-        self._image_sha1_index = {}
-        for ip in image_parts:
-            self._image_sha1_index[ip.sha1] = ip
+        # Descriptor-keyed cache: maps image_descriptor -> (image_part, image)
+        # This is the primary dedup mechanism and avoids expensive content hashing.
+        self._image_descriptor_index = {}
 
         # Start the partname counter after all existing image parts to avoid
         # collisions with partnames already in the package.
@@ -199,35 +195,40 @@ class DocxTemplate(object):
     def _get_or_add_image_part(self, image_descriptor):
         """Return (image_part, image) for the given image_descriptor.
 
-        Performs the same function as python-docx's
-        Package.get_or_add_image_part() but with O(1) SHA1 deduplication
-        (instead of O(n) linear scan with repeated SHA1 recomputation) and
-        sequential partname assignment (instead of O(n²) gap-search).
+        Uses the descriptor itself (file path) as the dedup key, avoiding
+        expensive content hashing.  Falls back to always creating a new part
+        for non-hashable descriptors (file-like objects).
         """
         from docx.image.image import Image
         from docx.opc.packuri import PackURI
         from docx.parts.image import ImagePart
 
+        # For string paths, use the path as a cheap dedup key.
+        cache_key = image_descriptor if isinstance(image_descriptor, str) else None
+
+        if cache_key is not None:
+            cached = self._image_descriptor_index.get(cache_key)
+            if cached is not None:
+                return cached
+
         image = Image.from_file(image_descriptor)
-        sha1 = image.sha1  # @lazyproperty — computed once per Image object
 
-        image_part = self._image_sha1_index.get(sha1)
-        if image_part is not None:
-            return image_part, image
-
-        # New unique image — create part with sequential partname
+        # Create image part with sequential partname
         self._image_part_counter += 1
         partname = PackURI(
             "/word/media/image%d.%s" % (self._image_part_counter, image.ext)
         )
         image_part = ImagePart.from_image(image, partname)
 
-        # Add to the package collection and the SHA1 index
+        # Add to the package collection
         package = self.docx._part._package
         package.image_parts.append(image_part)
-        self._image_sha1_index[sha1] = image_part
 
-        return image_part, image
+        result = (image_part, image)
+        if cache_key is not None:
+            self._image_descriptor_index[cache_key] = result
+
+        return result
 
     def __getattr__(self, name):
         return getattr(self.docx, name)
