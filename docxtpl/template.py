@@ -194,7 +194,7 @@ class DocxTemplate(object):
         max_index = 0
         for ip in image_parts:
             # Partnames follow /word/media/imageN.ext pattern
-            name = ip.partname.baseURI if hasattr(ip.partname, 'baseURI') else str(ip.partname)
+            name = str(ip.partname)
             m = re.search(r'/image(\d+)\.', name)
             if m:
                 idx = int(m.group(1))
