@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from os import PathLike
 from typing import TYPE_CHECKING, Any, Optional, IO, Union, Dict, Set
-import functools
 import io
 from lxml import etree
 from docx import Document
@@ -18,7 +17,7 @@ import docx.oxml.ns
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE as REL_TYPE
-from jinja2 import Environment, Template, meta
+from jinja2 import Environment, meta
 from jinja2.exceptions import TemplateError
 
 
@@ -130,6 +129,30 @@ class DocxTemplate(object):
     _RE_RUN_PROPS = re.compile(r"<w:rPr>.*?</w:rPr>")
     _RE_PARA_PROPS = re.compile(r"<w:pPr>.*?</w:pPr>")
 
+    # Pre-compiled patterns for tag-stripping in patch_xml().
+    # Strips surrounding <w:y> tags from {%y ...%} / {{y ...}} template tags.
+    _RE_TAG_STRIP = tuple(
+        re.compile(
+            r"<w:%s[ >](?:(?!<w:%s[ >]).)*({%%|{{)%s ([^}%%]*(?:%%}|}})).*?</w:%s>"
+            % (y, y, y, y),
+            re.DOTALL,
+        )
+        for y in ("tr", "tc", "p", "r")
+    )
+    # Same for {#y ...#} comment tags (not 'r' - comments in runs are uncommon).
+    _RE_COMMENT_STRIP = tuple(
+        re.compile(
+            r"<w:%s[ >](?:(?!<w:%s[ >]).)*({#)%s ([^}#]*(?:#})).*?</w:%s>"
+            % (y, y, y, y),
+            re.DOTALL,
+        )
+        for y in ("tr", "tc", "p")
+    )
+
+    # Precompiled pattern for fast detection of any Jinja syntax in a string.
+    # Used in render() to skip header/footer processing when no tags are present.
+    _JINJA_PATTERN = re.compile(r'\{\{|\{%|\{#')
+
     def __init__(self, template_file: Union[IO[bytes], str, PathLike]) -> None:
         self.template_file = template_file
         self.reset_replacements()
@@ -224,25 +247,15 @@ class DocxTemplate(object):
         # -%} will merge with next paragraph text
         src_xml = self._RE_MERGE_NEXT.sub("%}", src_xml)
 
-        for y in ["tr", "tc", "p", "r"]:
-            # replace into xml code the row/paragraph/run containing
-            # {%y xxx %} or {{y xxx}} template tag
-            # by {% xxx %} or {{ xx }} without any surrounding <w:y> tags :
-            # This is mandatory to have jinja2 generating correct xml code
-            pat = (
-                r"<w:%(y)s[ >](?:(?!<w:%(y)s[ >]).)*({%%|{{)%(y)s ([^}%%]*(?:%%}|}})).*?</w:%(y)s>"
-                % {"y": y}
-            )
-            src_xml = re.sub(pat, r"\1 \2", src_xml, flags=re.DOTALL)
+        # Strip surrounding <w:y> tags from {%y ...%} / {{y ...}} template tags.
+        # This is mandatory for jinja2 to generate correct xml code.
+        # Patterns are pre-compiled as class attributes to avoid recompilation.
+        for pat in self._RE_TAG_STRIP:
+            src_xml = pat.sub(r"\1 \2", src_xml)
 
-        for y in ["tr", "tc", "p"]:
-            # same thing, but for {#y xxx #} (but not where y == 'r', since that
-            # makes less sense to use comments in that context
-            pat = (
-                r"<w:%(y)s[ >](?:(?!<w:%(y)s[ >]).)*({#)%(y)s ([^}#]*(?:#})).*?</w:%(y)s>"
-                % {"y": y}
-            )
-            src_xml = re.sub(pat, r"\1 \2", src_xml, flags=re.DOTALL)
+        # Same for {#y ...#} comment tags (not 'r' — comments in runs are uncommon).
+        for pat in self._RE_COMMENT_STRIP:
+            src_xml = pat.sub(r"\1 \2", src_xml)
 
         # add vMerge
         # use {% vm %} to make this table cell and its copies
@@ -414,6 +427,10 @@ class DocxTemplate(object):
                     part._blob = xml.encode("utf-8")
 
     def resolve_listing(self, xml):
+        # Early exit: if no Listing special characters are present (common case),
+        # there's nothing to resolve, skip the work below.
+        if "\t" not in xml and "\n" not in xml and "\a" not in xml and "\f" not in xml:
+            return xml
 
         def resolve_text(run_properties, paragraph_properties, m):
             xml = m.group(0).replace(
@@ -467,21 +484,57 @@ class DocxTemplate(object):
         return xml
 
     def map_tree(self, tree):
-        """Replace body content with rendered tree.
-        
-        Instead of replacing the entire <w:body> element with replace() (which
-        triggers expensive reconciliation), we now mutate the body's children
-        directly. This is much cheaper for large trees.
+        """Replace the body element with the rendered tree.
+
+        Instead of iterating over all body children to remove/re-append them
+        one-by-one (O(n) lxml operations, each with internal bookkeeping),
+        we swap the entire <w:body> element in the document root using
+        root.remove() + root.insert(). This is O(1) since the root element
+        (<w:document>) has only a handful of direct children.
+
+        The body's index is located first so document element order is
+        preserved (e.g. body before sectPr).
+
+        SAFETY: If the body is not a direct child of root (malformed template)
+        or if remove/insert raises for any reason, we fall back to the slower
+        child-by-child copy so rendering is never broken.
         """
-        body = self.docx._element.body
-        
-        # Remove all existing children from body
-        for child in list(body):
-            body.remove(child)
-        
-        # Append all children from the new tree
-        for child in list(tree):
-            body.append(child)
+        root = self.docx._element
+        old_body = root.body
+
+        # Find where <w:body> sits among root's direct children so we can
+        # re-insert the new tree at the same position.
+        body_index = None
+        for i, child in enumerate(root):
+            if child is old_body:
+                body_index = i
+                break
+
+        if body_index is None:
+            # Malformed template – body is not a direct child of root.
+            # Fall back to child-by-child replacement on the existing body.
+            for child in list(old_body):
+                old_body.remove(child)
+            for child in list(tree):
+                old_body.append(child)
+            return
+
+        try:
+            # Detach the old body and insert the new tree (which is itself a
+            # <w:body> element returned by fix_tables/parse_xml) at the same
+            # position. This avoids O(n) per-child remove/append calls.
+            root.remove(old_body)
+            root.insert(body_index, tree)
+        except Exception:
+            # If something went wrong, restore the document to a usable state
+            # by re-attaching the old body (if it was already detached) and
+            # falling back to child-by-child copy.
+            if old_body.getparent() is None:
+                root.insert(body_index, old_body)
+            for child in list(old_body):
+                old_body.remove(child)
+            for child in list(tree):
+                old_body.append(child)
 
     def get_headers_footers(self, uri):
         for relKey, val in self.docx._part.rels.items():
@@ -537,33 +590,50 @@ class DocxTemplate(object):
         # Body
         xml_src = self.build_xml(context, jinja_env)
 
-        # fix tables if needed
+        # Fix tables if needed
         tree = self.fix_tables(xml_src)
 
-        # fix docPr ID's
+        # Fix docPr ID's
         self.fix_docpr_ids(tree)
 
         # Replace body xml tree
         self.map_tree(tree)
 
-        # Headers
-        headers = self.build_headers_footers_xml(context, self.HEADER_URI, jinja_env)
-        for relKey, xml in headers:
-            self.map_headers_footers_xml(relKey, xml)
+        # Headers & Footers - skip when no Jinja tags are present.
+        # Uses both _JINJA_PATTERN (intact tags) and _RE_JINJA_OPEN (tags
+        # split across XML runs by Word).
+        for uri in (self.HEADER_URI, self.FOOTER_URI):
+            try:
+                has_jinja = any(
+                    self._JINJA_PATTERN.search(xml)
+                    or self._RE_JINJA_OPEN.search(xml)
+                    for xml in (
+                        self.get_part_xml(part)
+                        for _relKey, part in self.get_headers_footers(uri)
+                    )
+                )
+                if has_jinja:
+                    for relKey, xml in self.build_headers_footers_xml(context, uri, jinja_env):
+                        self.map_headers_footers_xml(relKey, xml)
+            except Exception:
+                # Fallback: guards against unexpected part structure (e.g. blob
+                # is None, missing attributes). Not malformed XML - that would
+                # fail in build_headers_footers_xml regardless.
+                for relKey, xml in self.build_headers_footers_xml(context, uri, jinja_env):
+                    self.map_headers_footers_xml(relKey, xml)
 
-        # Footers
-        footers = self.build_headers_footers_xml(context, self.FOOTER_URI, jinja_env)
-        for relKey, xml in footers:
-            self.map_headers_footers_xml(relKey, xml)
-
+        # Properties: no skip-check needed - these are a handful of short
+        # strings (author, title, etc.) where from_string() is near-zero cost.
         self.render_properties(context, jinja_env)
 
+        # Footnotes: no skip-check needed - at most one part exists in typical
+        # documents, and many have none, so the loop body rarely executes.
         self.render_footnotes(context, jinja_env)
 
         # set rendered flag
         self.is_rendered = True
 
-    # using of TC tag in for cycle can cause that count of columns does not
+    # Using of TC tag in for cycle can cause that count of columns does not
     # correspond to real count of columns in row.
     def fix_tables(self, xml):
         # Use parse_xml with safe fallback for malformed XML
