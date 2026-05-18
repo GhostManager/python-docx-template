@@ -22,8 +22,6 @@ import logging
 from jinja2 import Environment, Template, meta
 from jinja2.exceptions import TemplateError
 
-logger = logging.getLogger(__name__)
-
 
 def _create_optimized_env(**kwargs):
     """Create an optimized Jinja2 environment for better performance.
@@ -497,10 +495,6 @@ class DocxTemplate(object):
 
         if body_index is None:
             # Malformed template – body is not a direct child; fall back.
-            logger.warning(
-                "map_tree: body is not a direct child of root (malformed template?). "
-                "Falling back to child-copy implementation."
-            )
             for child in list(old_body):
                 old_body.remove(child)
             for child in list(tree):
@@ -511,10 +505,6 @@ class DocxTemplate(object):
             root.remove(old_body)
             root.insert(body_index, tree)
         except Exception:
-            logger.warning(
-                "map_tree: optimized remove/insert failed; falling back to child-copy.",
-                exc_info=True,
-            )
             # Re-attach old_body if it was already removed before the failure.
             if old_body.getparent() is None:
                 root.insert(body_index, old_body)
@@ -598,12 +588,6 @@ class DocxTemplate(object):
                     for relKey, xml in self.build_headers_footers_xml(context, uri, jinja_env):
                         self.map_headers_footers_xml(relKey, xml)
             except Exception:
-                logger.warning(
-                    "render: header/footer Jinja-tag check failed for %s; "
-                    "falling back to full processing.",
-                    uri,
-                    exc_info=True,
-                )
                 for relKey, xml in self.build_headers_footers_xml(context, uri, jinja_env):
                     self.map_headers_footers_xml(relKey, xml)
 
