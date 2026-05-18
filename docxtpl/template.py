@@ -578,38 +578,49 @@ class DocxTemplate(object):
         # Body
         xml_src = self.build_xml(context, jinja_env)
 
-        # fix tables if needed
+        # Fix tables if needed
         tree = self.fix_tables(xml_src)
 
-        # fix docPr ID's
+        # Fix docPr ID's
         self.fix_docpr_ids(tree)
 
         # Replace body xml tree
         self.map_tree(tree)
 
-        # Headers & Footers – skip entirely when no Jinja tags are present to
-        # avoid unnecessary XML parsing, patch_xml, and part replacement.
+        # Headers & Footers - skip when no Jinja tags are present.
+        # Uses both _JINJA_PATTERN (intact tags) and _RE_JINJA_OPEN (tags
+        # split across XML runs by Word). Falls back to full render on error.
         for uri in (self.HEADER_URI, self.FOOTER_URI):
             try:
                 has_jinja = any(
-                    self._JINJA_PATTERN.search(self.get_part_xml(part))
-                    for _relKey, part in self.get_headers_footers(uri)
+                    self._JINJA_PATTERN.search(xml)
+                    or self._RE_JINJA_OPEN.search(xml)
+                    for xml in (
+                        self.get_part_xml(part)
+                        for _relKey, part in self.get_headers_footers(uri)
+                    )
                 )
                 if has_jinja:
                     for relKey, xml in self.build_headers_footers_xml(context, uri, jinja_env):
                         self.map_headers_footers_xml(relKey, xml)
             except Exception:
+                # Fallback: if the fast-path check raises (e.g. malformed XML
+                # in a part), process all headers/footers unconditionally.
                 for relKey, xml in self.build_headers_footers_xml(context, uri, jinja_env):
                     self.map_headers_footers_xml(relKey, xml)
 
+        # Properties: no skip-check needed - these are a handful of short
+        # strings (author, title, etc.) where from_string() is near-zero cost.
         self.render_properties(context, jinja_env)
 
+        # Footnotes: no skip-check needed - at most one part exists in typical
+        # documents, and many have none, so the loop body rarely executes.
         self.render_footnotes(context, jinja_env)
 
         # set rendered flag
         self.is_rendered = True
 
-    # using of TC tag in for cycle can cause that count of columns does not
+    # Using of TC tag in for cycle can cause that count of columns does not
     # correspond to real count of columns in row.
     def fix_tables(self, xml):
         # Use parse_xml with safe fallback for malformed XML
