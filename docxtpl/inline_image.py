@@ -112,10 +112,12 @@ class InlineImage(object):
         # cached because each insertion needs a unique shape_id - header/footer
         # and footnote parts are not renumbered by fix_docpr_ids().
         cache = self.tpl._image_cache
-        # For hashable descriptors (strings, paths), cache by value.
-        # For unhashable descriptors (file-like objects), skip caching
-        # entirely — using id() would risk aliasing after GC.
+        # For hashable, value-stable descriptors (strings, paths), cache by
+        # value. File-like objects are mutable even when hashable (BytesIO,
+        # open file handles), so never cache their image metadata.
         try:
+            if hasattr(image_descriptor, "read"):
+                raise TypeError
             cache_key = (id(part), image_descriptor, self.width, self.height)
             hash(cache_key) is not None  # trigger TypeError if unhashable
         except TypeError:
