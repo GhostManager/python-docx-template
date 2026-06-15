@@ -1,3 +1,30 @@
+0.21.0 (2026-06-15)
+-------------------
+- Review of dev branch changes mirrored from upstream:
+  optimized document rendering by using faster XML parsing/body replacement,
+  reducing header/footer work when no Jinja tags are present, precompiling
+  tag-stripping regexes, and short-circuiting listing resolution when no
+  special listing characters are present.
+- Improved InlineImage performance by prebuilding reusable image XML,
+  deduplicating image parts by stable descriptors, caching image metadata
+  instead of full XML, deriving image part counters from existing media names,
+  and initializing drawing IDs from existing document/header/footer/footnote
+  IDs to avoid collisions.
+- Fixed InlineImage edge cases for Ghostwriter-style report generation:
+  file-like image descriptors are no longer cached, mutable streams can be
+  reused safely within a render, ``None`` filenames are normalized, and the
+  fast XML template now writes placeholders into explicit XML attributes with
+  a python-docx fallback if the optimized template is incompatible.
+- Fixed header/footer rendering with custom Jinja delimiters by detecting
+  Jinja syntax from the active ``jinja_env`` instead of hard-coded default
+  delimiters.
+- Merged upstream PR #626 to emit RichText font properties in the OOXML order
+  expected by Word.
+- Added regression coverage for custom header/footer delimiters, mutable
+  file-like InlineImage descriptors, and InlineImage XML template generation.
+- Fixed Poetry project metadata required by the build configuration and added
+  repository ignore rules for macOS ``.DS_Store`` files.
+
 0.20.2 (2025-11-13)
 -------------------
 - Fix fix_tables()
