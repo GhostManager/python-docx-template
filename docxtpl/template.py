@@ -149,9 +149,8 @@ class DocxTemplate(object):
         for y in ("tr", "tc", "p")
     )
 
-    # Precompiled pattern for fast detection of any Jinja syntax in a string.
-    # Used in render() to skip header/footer processing when no tags are present.
-    _JINJA_PATTERN = re.compile(r'\{\{|\{%|\{#')
+    # Cached delimiter patterns for fast header/footer Jinja detection.
+    _JINJA_START_PATTERNS = {}
 
     def __init__(self, template_file: Union[IO[bytes], str, PathLike]) -> None:
         self.template_file = template_file
@@ -655,19 +654,45 @@ class DocxTemplate(object):
             return m.group(1)
         return "utf-8"
 
+    @classmethod
+    def _get_jinja_start_pattern(cls, delimiter):
+        pattern = cls._JINJA_START_PATTERNS.get(delimiter)
+        if pattern is None:
+            pattern = re.compile(
+                r"(<[^>]*>)*".join(re.escape(char) for char in delimiter),
+                re.DOTALL,
+            )
+            cls._JINJA_START_PATTERNS[delimiter] = pattern
+        return pattern
+
+    def _has_jinja_tags(self, xml, jinja_env=None):
+        if jinja_env is None:
+            jinja_env = _get_cached_env()
+
+        start_strings = (
+            jinja_env.block_start_string,
+            jinja_env.variable_start_string,
+            jinja_env.comment_start_string,
+        )
+        return any(
+            start_string in xml
+            or self._get_jinja_start_pattern(start_string).search(xml)
+            for start_string in start_strings
+        )
+
     def build_headers_footers_xml(self, context, uri, jinja_env=None):
         for relKey, part in self.get_headers_footers(uri):
             xml = self.get_part_xml(part)
-            
-            # Skip rendering if no Jinja tags present
-            # Headers/footers are often static, so this avoids caching/parsing overhead
-            if self._RE_JINJA_OPEN.search(xml) or self._RE_JINJA_CONTENT.search(xml):
-                encoding = self.get_headers_footers_encoding(xml)
+
+            encoding = self.get_headers_footers_encoding(xml)
+
+            # Skip rendering if no Jinja tags present. Use the active Jinja
+            # environment so custom delimiters in headers/footers are honored.
+            if self._has_jinja_tags(xml, jinja_env):
                 xml = self.patch_xml(xml)
                 xml = self.render_xml_part(xml, part, context, jinja_env)
                 yield relKey, xml.encode(encoding)
             else:
-                encoding = self.get_headers_footers_encoding(xml)
                 yield relKey, xml.encode(encoding)
 
     def map_headers_footers_xml(self, relKey, xml):
@@ -705,13 +730,10 @@ class DocxTemplate(object):
         self.map_tree(tree)
 
         # Headers & Footers - skip when no Jinja tags are present.
-        # Uses both _JINJA_PATTERN (intact tags) and _RE_JINJA_OPEN (tags
-        # split across XML runs by Word).
         for uri in (self.HEADER_URI, self.FOOTER_URI):
             try:
                 has_jinja = any(
-                    self._JINJA_PATTERN.search(xml)
-                    or self._RE_JINJA_OPEN.search(xml)
+                    self._has_jinja_tags(xml, jinja_env)
                     for xml in (
                         self.get_part_xml(part)
                         for _relKey, part in self.get_headers_footers(uri)
