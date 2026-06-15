@@ -658,6 +658,8 @@ class DocxTemplate(object):
     def _get_jinja_start_pattern(cls, delimiter):
         pattern = cls._JINJA_START_PATTERNS.get(delimiter)
         if pattern is None:
+            # Word can split a delimiter across XML runs, e.g. "[[" may become
+            # "[<w:r>...</w:r>[". Allow XML tags between delimiter characters
             pattern = re.compile(
                 r"(<[^>]*>)*".join(re.escape(char) for char in delimiter),
                 re.DOTALL,
@@ -669,12 +671,16 @@ class DocxTemplate(object):
         if jinja_env is None:
             jinja_env = _get_cached_env()
 
+        # Use the active environment's delimiters so custom Jinja syntax in
+        # headers/footers is detected by the same rules used during rendering
         start_strings = (
             jinja_env.block_start_string,
             jinja_env.variable_start_string,
             jinja_env.comment_start_string,
         )
         return any(
+            # Fast path for intact delimiters; regex path catches delimiters
+            # fragmented by Word's XML run markup
             start_string in xml
             or self._get_jinja_start_pattern(start_string).search(xml)
             for start_string in start_strings
